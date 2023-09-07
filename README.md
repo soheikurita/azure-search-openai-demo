@@ -1,6 +1,10 @@
 # ChatGPT + Enterprise data with Azure OpenAI and Cognitive Search
 ## 日本語カスタマイズ版
 
+> [!IMPORTANT]
+> このリポジトリは古いバージョンです。
+> 新しいバージョンは https://github.com/nohanaga/azure-search-openai-demo/tree/busho ブランチで作業しています。
+
 このサンプルでは、Retrieval Augmented Generation パターンを使用して、独自のデータに対してChatGPT のような体験を作成するためのいくつかのアプローチを示しています。ChatGPT モデル（gpt-35-turbo）にアクセスするために Azure OpenAI Service を使用し、データのインデックス作成と検索に Azure Cognitive Search を使用しています。
 
 レポジトリにはサンプルデータが含まれているので、すぐに End-to-End で試すことができます。このサンプルアプリケーションでは、日本の鎌倉時代の武将に関する Wikipedia データが含まれており、鎌倉幕府や武将について質問できるような体験ができます。

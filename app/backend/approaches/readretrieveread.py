@@ -1,122 +1,163 @@
+import csv
+import logging
+from typing import Any
+
 import openai
-from approaches.approach import Approach
-from azure.search.documents import SearchClient
+from azure.search.documents.aio import SearchClient
 from azure.search.documents.models import QueryType
-from langchain.llms.openai import AzureOpenAI
-from langchain.callbacks.base import CallbackManager
-from langchain.chains import LLMChain
-from langchain.agents import Tool, ZeroShotAgent, AgentExecutor
-from langchain.llms.openai import AzureOpenAI
+from langchain.agents import (
+    AgentType,
+    Tool,
+    initialize_agent,
+)
+from langchain.agents.mrkl import prompt
+from langchain.callbacks.manager import CallbackManager
+from langchain.chat_models import AzureChatOpenAI
+from langchain.tools import BaseTool
+
+from approaches.approach import AskApproach
 from langchainadapters import HtmlCallbackHandler
 from text import nonewlines
-from lookuptool import CsvLookupTool
 
-# 質問に対して、どのような情報が欠けているのかを確認するために、質問を繰り返し評価し、すべての情報が揃ったところで、回答を作成することを試みる。
-# 各反復は 2 つの部分で構成されています。
-# 1 つ目は GPT を使ってより多くの情報が必要かどうかを確認し、2 つ目はより多くのデータが必要な場合、要求された「ツール」を使ってそれを取得することです。
-# GPT の最後の呼び出しは、実際の質問に答えるものです。
-# これはMKRL論文[1]に触発され、Langchain の実装を使ってここで適用されています。
-# [1] E. Karpas, et al. arXiv:2205.00445
+class ReadRetrieveReadApproach(AskApproach):
+    """
+    質問に対して、どのような情報が欠けているのかを確認するために、質問を繰り返し評価し、すべての情報が揃ったところで、回答を作成することを試みる。
+    各反復は 2 つの部分で構成されています。
+     1. GPT を使用して、さらに情報が必要かどうかを確認する。
+     2.より多くのデータが必要な場合は、要求された「ツール」を使ってデータを取得する。
+    GPT への最後の呼び出しが、実際の質問に答える。
+    これは、MRKL の論文[1]にインスパイアされ、Langchain の実装を使ってここで適用されている。
 
-# Attempt to answer questions by iteratively evaluating the question to see what information is missing, and once all information
-# is present then formulate an answer. Each iteration consists of two parts: first use GPT to see if we need more information, 
-# second if more data is needed use the requested "tool" to retrieve it. The last call to GPT answers the actual question.
-# This is inspired by the MKRL paper[1] and applied here using the implementation in Langchain.
-# [1] E. Karpas, et al. arXiv:2205.00445
-class ReadRetrieveReadApproach(Approach):
+    [1] E. Karpas, et al. arXiv:2205.00445
+    """
 
-    template_prefix = \
-"あなたは日本の歴史に関する質問をサポートする教師アシスタントです。" \
-"以下の情報源に記載されているデータのみを用いて、質問に答えてください。" \
-"各ソースには、名前の後にコロンと実際のデータがあり、レスポンスで使用する各データのソース名を引用します。" \
-"例えば、質問が「空の色は何色ですか」というもので、ソースの1つに「info-123.txt:空は曇っていないときはいつでも青い」と書いてあれば、「空は青い [info-123.txt]」と答えればよいのです。" \
-"各出典元には、名前の後にコロンと実際の情報があり、回答で使用する各事実には必ず出典名を記載してください。ソースを参照するには、四角いブラケットを使用します。例えば、[info1.txt]です。出典を組み合わせず、各出典を別々に記載すること。例えば、[info1.txt][info2.pdf] など。" \
-"ツール名をソースとして引用することは絶対に避けてください。" \
-"以下の資料で答えられない場合は、「わからない」と答えてください。" \
-"\n\n以下のツールにアクセスすることができます:"
-    
-    template_suffix = """
-Begin!
-
-Question: {input}
-
-Thought: {agent_scratchpad}"""    
-
-    CognitiveSearchToolDescription = "日本の歴史情報の検索に便利です。"
-
-    def __init__(self, search_client: SearchClient, openai_deployment: str, sourcepage_field: str, content_field: str):
+    def __init__(self, search_client: SearchClient, openai_deployment: str, embedding_deployment: str, sourcepage_field: str, content_field: str):
         self.search_client = search_client
         self.openai_deployment = openai_deployment
+        self.embedding_deployment = embedding_deployment
         self.sourcepage_field = sourcepage_field
         self.content_field = content_field
 
-    def retrieve(self, q: str, overrides: dict) -> any:
-        use_semantic_captions = True if overrides.get("semantic_captions") else False
+    async def retrieve(self, query_text: str, overrides: dict[str, Any]) -> Any:
+        has_text = overrides.get("retrieval_mode") in ["text", "hybrid", None]
+        has_vector = overrides.get("retrieval_mode") in ["vectors", "hybrid", None]
+        use_semantic_captions = True if overrides.get("semantic_captions") and has_text else False
         top = overrides.get("top") or 3
         exclude_category = overrides.get("exclude_category") or None
         filter = "category ne '{}'".format(exclude_category.replace("'", "''")) if exclude_category else None
+        # If retrieval mode includes vectors, compute an embedding for the query
+        if has_vector:
+            query_vector = (await openai.Embedding.acreate(engine=self.embedding_deployment, input=query_text))["data"][0]["embedding"]
+        else:
+            query_vector = None
 
-        if overrides.get("semantic_ranker"):
-            r = self.search_client.search(q,
-                                          filter=filter, 
-                                          query_type=QueryType.SEMANTIC, 
-                                          query_language="ja-jp", 
-                                          query_speller="none", 
-                                          semantic_configuration_name="default", 
+        # Only keep the text query if the retrieval mode uses text, otherwise drop it
+        if not has_text:
+            query_text = ""
+
+        # Use semantic ranker if requested and if retrieval mode is text or hybrid (vectors + text)
+        if overrides.get("semantic_ranker") and has_text:
+            r = await self.search_client.search(query_text,
+                                          filter=filter,
+                                          query_type=QueryType.SEMANTIC,
+                                          query_language="ja-jp",
+                                          query_speller="none",
+                                          semantic_configuration_name="default",
                                           top = top,
-                                          query_caption="extractive|highlight-false" if use_semantic_captions else None)
+                                          query_caption="extractive|highlight-false" if use_semantic_captions else None,
+                                          vector=query_vector,
+                                          top_k=50 if query_vector else None,
+                                          vector_fields="embedding" if query_vector else None)
         else:
-            r = self.search_client.search(q, filter=filter, top=top)
+            r = await self.search_client.search(query_text,
+                                          filter=filter,
+                                          top=top,
+                                          vector=query_vector,
+                                          top_k=50 if query_vector else None,
+                                          vector_fields="embedding" if query_vector else None)
         if use_semantic_captions:
-            self.results = [doc[self.sourcepage_field] + ":" + nonewlines(" -.- ".join([c.text for c in doc['@search.captions']])) for doc in r]
+            results = [doc[self.sourcepage_field] + ":" + nonewlines(" -.- ".join([c.text for c in doc['@search.captions']])) for doc in r]
         else:
-            #self.results = [doc[self.sourcepage_field] + ":" + nonewlines(doc[self.content_field][:250]) for doc in r]
-            self.results = [doc[self.sourcepage_field] + ":" + nonewlines(doc[self.content_field]) for doc in r]
-        content = "\n".join(self.results)
-        return content
-        
-    def run(self, q: str, overrides: dict) -> any:
-        # Not great to keep this as instance state, won't work with interleaving (e.g. if using async), but keeps the example simple
-        self.results = None
+            results = [doc[self.sourcepage_field] + ":" + nonewlines(doc[self.content_field]) async for doc in r]
+        content = "\n".join(results)
+        return results, content
+
+    async def run(self, q: str, overrides: dict[str, Any]) -> dict[str, Any]:
+
+        retrieve_results = None
+        async def retrieve_and_store(q: str) -> Any:
+            nonlocal retrieve_results
+            retrieve_results, content = await self.retrieve(q, overrides)
+            return content
 
         # Use to capture thought process during iterations
         cb_handler = HtmlCallbackHandler()
         cb_manager = CallbackManager(handlers=[cb_handler])
+
+        # Tool dataclass 法と Subclassing the BaseTool class 法の異なる記法を示しています
+        tools = [
+            Tool(name="PeopleSearchTool",
+                func=retrieve_and_store,
+                coroutine=retrieve_and_store,
+                description="日本の歴史の人物情報の検索に便利です。ユーザーの質問から検索クエリーを生成して検索します。クエリーは文字列のみを受け付けます"
+                ),
+            CafeSearchTool()
+        ]
         
-        acs_tool = Tool(name = "CognitiveSearch", func = lambda q: self.retrieve(q, overrides), description = self.CognitiveSearchToolDescription)
-        #hana debug 今回はテストのため、引数を源範頼に固定しています
-        #lookup するためのキーワードの生成方法は、別途考える必要があります
-        employee_tool = EmployeeInfoTool("源範頼")
-        tools = [acs_tool, employee_tool]
+       #llm = ChatOpenAI(model_name="gpt-4-0613", temperature=0)
+        llm = AzureChatOpenAI(deployment_name=self.openai_deployment,
+                              temperature=overrides.get("temperature") or 0.3,
+                              openai_api_base=openai.api_base,
+                              openai_api_version=openai.api_version,
+                              openai_api_type=openai.api_type,
+                              openai_api_key=openai.api_key)
+        SUFFIX = """
+        Answer should be in Japanese.
+        """
+        agent_chain = initialize_agent(tools,
+                                    llm,
+                                    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+                                    #agent=AgentType.OPENAI_FUNCTIONS,
+                                    verbose=True,
+                                    agent_kwargs=dict(suffix=SUFFIX + prompt.SUFFIX),
+                                    callback_manager = cb_manager,
+                                    handle_parsing_errors=True,
+                                    max_iterations=5,
+                                    early_stopping_method="generate")
+        #最大反復回数を制限する max_iterations, early_stopping_method
+        #https://python.langchain.com/docs/modules/agents/how_to/max_iterations
+        #解析エラーを処理する handle_parsing_errors
+        #https://python.langchain.com/docs/modules/agents/how_to/handle_parsing_errors
 
-        prompt = ZeroShotAgent.create_prompt(
-            tools=tools,
-            prefix=overrides.get("prompt_template_prefix") or self.template_prefix,
-            suffix=overrides.get("prompt_template_suffix") or self.template_suffix,
-            input_variables = ["input", "agent_scratchpad"])
-        print(prompt)
-        llm = AzureOpenAI(deployment_name=self.openai_deployment, temperature=overrides.get("temperature") or 0.3, openai_api_key=openai.api_key)
-        chain = LLMChain(llm = llm, prompt = prompt)
-        agent_exec = AgentExecutor.from_agent_and_tools(
-            agent = ZeroShotAgent(llm_chain = chain, tools = tools),
-            tools = tools, 
-            verbose = True, 
-            callback_manager = cb_manager)
-        result = agent_exec.run(q)
-                
+        result = await agent_chain.arun(q)
         # Remove references to tool names that might be confused with a citation
-        result = result.replace("[CognitiveSearch]", "").replace("[Employee]", "")
+        #result = result.replace("[CognitiveSearch]", "").replace("[Employee]", "")
+        return {"data_points": retrieve_results or [], "answer": result, "thoughts": cb_handler.get_and_reset_log()}
 
-        return {"data_points": self.results or [], "answer": result, "thoughts": cb_handler.get_and_reset_log()}
+# 検索を行うカスタムツールを定義。CSV からルックアップを行う例です。
+# Subclassing the BaseTool class
+# https://python.langchain.com/docs/modules/agents/tools/custom_tools
+class CafeSearchTool(BaseTool):
+    data: dict[str, str] = {}
+    name = "CafeSearchTool"
+    description = "武将のゆかりのカフェを検索するのに便利です。カフェの検索クエリには、武将の**名前のみ**を入力してください。"
 
-class EmployeeInfoTool(CsvLookupTool):
-    employee_name: str = ""
+    # Use the tool synchronously.
+    def _run(self, query: str) -> str:
+        """Use the tool."""
+        return query
 
-    def __init__(self, employee_name: str):
-        #hana debug デモのためにサンプルで武将ゆかりの地にあるカフェのデータセットを用意しています
-        super().__init__(filename = "data/restaurantinfo.csv", key_field = "name", name = "源範頼", description = "ゆかりの地にあるカフェに関する質問に答えるのに便利です。")
-        self.func = self.employee_info
-        self.employee_name = employee_name
+    # Use the tool asynchronously.
+    async def _arun(self, query: str) -> str:
+        filename = "data/restaurantinfo.csv"
+        key_field = "name"
+        try:
+            with open(filename, newline='', encoding='utf-8') as csvfile:
+                reader = csv.DictReader(csvfile)
+                for row in reader:
+                    self.data[row[key_field]] =  "\n".join([f"{i}:{row[i]}" for i in row])
 
-    def employee_info(self, unused: str) -> str:
-        return self.lookup(self.employee_name)
+        except Exception as e:
+            logging.exception("File read error:", e)
+
+        return self.data.get(query, "")

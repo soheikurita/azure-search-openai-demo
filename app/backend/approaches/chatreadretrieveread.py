@@ -1,115 +1,234 @@
+import logging
+from typing import Any, AsyncGenerator
+
 import openai
-from azure.search.documents import SearchClient
+from azure.search.documents.aio import SearchClient
 from azure.search.documents.models import QueryType
-from approaches.approach import Approach
+
+from core.messagebuilder import MessageBuilder
+from core.modelhelper import get_token_limit
 from text import nonewlines
 
-# Simple retrieve-then-read implementation, using the Cognitive Search and OpenAI APIs directly. It first retrieves
-# top documents from search, then constructs a prompt with them, and then uses OpenAI to generate an completion 
-# (answer) with that prompt.
+class ChatReadRetrieveReadApproach:
 
-# Cognitive SearchとOpenAIのAPIを直接使用した、シンプルな retrieve-then-read の実装です。これは、最初に
-# 検索からトップ文書を抽出し、それを使ってプロンプトを構成し、OpenAIで補完生成する (answer)をそのプロンプトで表示します。
+    # Chat roles
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
 
-class ChatReadRetrieveReadApproach(Approach):
-    prompt_prefix = """<|im_start|>system
-日本の歴史に関する質問をサポートする教師アシスタントです。回答は簡潔にしてください。
-以下の出典リストに記載されている事実のみを回答してください。以下の情報が十分でない場合は、「わからない」と答えてください。以下の出典を使用しない回答は作成しないでください。ユーザーに明確な質問をすることが助けになる場合は、質問してください。
-各出典元には、名前の後にコロンと実際の情報があり、回答で使用する各事実には必ず出典名を記載してください。ソースを参照するには、四角いブラケットを使用します。例えば、[info1.txt]です。出典を組み合わせず、各出典を別々に記載すること。例えば、[info1.txt][info2.pdf] など。
+    """
+    Simple retrieve-then-read implementation, using the Cognitive Search and OpenAI APIs directly. It first retrieves
+    top documents from search, then constructs a prompt with them, and then uses OpenAI to generate an completion
+    (answer) with that prompt.
+
+    Cognitive SearchとOpenAIのAPIを直接使用した、シンプルな retrieve-then-read の実装です。これは、最初に
+    検索からトップ文書を抽出し、それを使ってプロンプトを構成し、OpenAIで補完生成する (answer)をそのプロンプトで表示します。
+    """
+
+    system_message_chat_conversation = """
+Answer the reading comprehension question on the history of the Kamakura period in Japan.
+If you cannot guess the answer to a question from the SOURCES, answer "I don't know".
+Answers must be in Japanese.
+
+# Restrictions
+- The SOURCES prefix has a colon and actual information after the filename, and each fact used in the response must include the name of the source.
+- To reference a source, use a square bracket. For example, [info1.txt]. Do not combine sources, but list each source separately. For example, [info1.txt][info2.pdf].
+
 {follow_up_questions_prompt}
 {injected_prompt}
-Sources:
-{sources}
-<|im_end|>
-{chat_history}
+"""
+    follow_up_questions_prompt_content = """
+Answers must be accompanied by three additional follow-up questions to the user's question. The rules for follow-up questions are defined in the Restrictions.
+
+- Please answer only questions related to the history of the Kamakura period in Japan. If the question is not related to the history of the Kamakura period in Japan, answer "I don't know".
+- Use double angle brackets to reference the questions, e.g. <<What did Minamotono Yoritomo do? >>.
+- Try not to repeat questions that have already been asked.
+- Do not add SOURCES to follow-up questions.
+- Do not use bulleted follow-up questions. Always enclose them in double angle brackets.
+- Follow-up questions should be ideas that expand the user's curiosity.
+- Only generate questions and do not generate any text before or after the questions, such as 'Next Questions'
+
+EXAMPLE:###
+Q:徳川家康はどのような人物ですか？
+A:徳川家康は、日本の戦国時代から江戸時代初期にかけての武将、大名、政治家であり、江戸幕府を開いた人物です。彼は義を重んじ、家来のことを大切にした人物とされています。また、負けず嫌いで血気盛んだったが、臆病だが冷静に対処できる性格だったとされています。 [徳川家康 - Wikipedia-2.pdf.txt][徳川家康 - Wikipedia-13.pdf][徳川家康-2.txt]<<徳川家康はどのような功績を残しましたか？>><<徳川家康はどのように江戸幕府を開いたのですか？>><<他にも有名な武将や大名はいますか？>>
+
+Q:関ケ原の戦いはどのような戦いですか？
+A:関ヶ原の戦いは、1600年10月21日に美濃国不破郡関ヶ原（岐阜県不破郡関ケ原町）で行われた野戦です。関ヶ原における決戦を中心に日本の全国各地で戦闘が行われ、関ヶ原の合戦・関ヶ原合戦とも呼ばれます。合戦当時は南北朝時代の古戦場・「青野原」や「青野カ原」と書かれた文献もある。主戦場となった関ヶ原古戦場跡は国指定の史跡となっています。豊臣秀吉が死んだ後の権力をめぐって石田三成が率いる西軍と、徳川家康が率いる東軍が戦いました。[徳川家康 - Wikipedia-2.pdf][石田三成 - Wikipedia-11.pdf]<<戦いの結果はどうなったのですか？>><<徳川家康と石田三成について教えてください>><<他にも有名な合戦がありますか？>>
+###
+
 """
 
-    follow_up_questions_prompt_content = """日本の歴史について、ユーザーが次に尋ねそうな非常に簡潔なフォローアップ質問を3つ作成する。
-    質問を参照するには、二重の角括弧を使用します（例：<<徳川家康とは何をした人ですか?>>）。
-    すでに聞かれた質問を繰り返さないようにしましょう。
-    質問のみを生成し、「次の質問」のような質問の前後にテキストを生成しない。"""
-
-    query_prompt_template = """以下は、これまでの会話の履歴と、日本の歴史に関するナレッジベースを検索して回答する必要がある、ユーザーからの新しい質問です。
-    会話と新しい質問に基づいて、検索クエリを作成します。
-    検索クエリには、引用元のファイル名や文書名（info.txtやdoc.pdfなど）を含めないでください。
-    検索キーワードに[]または<<>>内のテキストを含めないでください。
-
-Chat History:
-{chat_history}
-
-Question:
-{question}
-
-Search query:
+    query_prompt_template = """
+Below is a history of previous conversations and a new question from a user that needs to be answered by searching the Knowledge Base on Japanese history.
+Based on the conversation and the new question, create a search query.
+Do not include the name of the cited file or document (e.g., info.txt or doc.pdf) in the search query.
+Do not include text in [] or <>> in the search query.
+If you cannot generate a search query, return only the number 0.
 """
+    query_prompt_few_shots = [
+        {'role' : USER, 'content' : '徳川家康ってなにした人  ' },
+        {'role' : ASSISTANT, 'content' : '徳川家康 人物 歴史' },
+        {'role' : USER, 'content' : '徳川家康の武功を教えてください' },
+        {'role' : ASSISTANT, 'content' : '徳川家康 人物 武功 業績' }
+    ]
 
-    def __init__(self, search_client: SearchClient, chatgpt_deployment: str, gpt_deployment: str, sourcepage_field: str, content_field: str):
+    def __init__(self, search_client: SearchClient, chatgpt_deployment: str, chatgpt_model: str, embedding_deployment: str, sourcepage_field: str, content_field: str):
         self.search_client = search_client
         self.chatgpt_deployment = chatgpt_deployment
-        self.gpt_deployment = gpt_deployment
+        self.chatgpt_model = chatgpt_model
+        self.embedding_deployment = embedding_deployment
         self.sourcepage_field = sourcepage_field
         self.content_field = content_field
+        self.chatgpt_token_limit = get_token_limit(chatgpt_model)
 
-    def run(self, history: list[dict], overrides: dict) -> any:
-        use_semantic_captions = True if overrides.get("semantic_captions") else False
+    async def run_until_final_call(self, history: list[dict[str, str]], overrides: dict[str, Any], should_stream: bool = False) -> tuple:
+        has_text = overrides.get("retrieval_mode") in ["text", "hybrid", None]
+        has_vector = overrides.get("retrieval_mode") in ["vectors", "hybrid", None]
+        use_semantic_captions = True if overrides.get("semantic_captions") and has_text else False
         top = overrides.get("top") or 3
         exclude_category = overrides.get("exclude_category") or None
         filter = "category ne '{}'".format(exclude_category.replace("'", "''")) if exclude_category else None
+
+        user_q = 'Generate search query for: ' + history[-1]["user"]
+
         # STEP 1: Generate an optimized keyword search query based on the chat history and the last question
-        prompt = self.query_prompt_template.format(chat_history=self.get_chat_history_as_text(history, include_last_turn=False), question=history[-1]["user"])
-        completion = openai.Completion.create(
-            engine=self.gpt_deployment, 
-            prompt=prompt, 
-            temperature=0.0, 
-            max_tokens=32, 
-            n=1, 
-            stop=["\n"])
-        q = completion.choices[0].text
-        print(q)
+        # チャット履歴と最後の質問に基づいて、最適化されたキーワード検索クエリを生成します。
+        messages = self.get_messages_from_history(
+            self.query_prompt_template,
+            self.chatgpt_model,
+            history,
+            user_q,
+            self.query_prompt_few_shots,
+            self.chatgpt_token_limit - len(user_q)
+            )
+
+        chat_completion = await openai.ChatCompletion.acreate(
+            deployment_id=self.chatgpt_deployment,
+            model=self.chatgpt_model,
+            messages=messages,
+            temperature=0.0,
+            max_tokens=100,
+            n=1)
+
+        query_text = chat_completion.choices[0].message.content
+        logging.debug(query_text)
+        if query_text.strip() == "0":
+            # Use the last user input if we failed to generate a better query
+            # より良いクエリを生成できなかった場合は、最後に入力されたクエリを使用する。
+            query_text = history[-1]["user"]
+
         # STEP 2: Retrieve relevant documents from the search index with the GPT optimized query
-        if overrides.get("semantic_ranker"):
-            r = self.search_client.search(q, 
+        # GPTで最適化されたクエリを使用して、検索インデックスから関連するドキュメントを取得します。
+
+        # If retrieval mode includes vectors, compute an embedding for the query
+        # 検索モードにベクトルが含まれている場合は、クエリの埋め込みを計算します。
+        if has_vector:
+            # ユーザーの入力をそのままベクトル化するアプローチも無くはない
+            # query_text = history[-1]["user"]
+
+            query_vector = (await openai.Embedding.acreate(engine=self.embedding_deployment, input=query_text))["data"][0]["embedding"]
+        else:
+            query_vector = None
+
+        # Only keep the text query if the retrieval mode uses text, otherwise drop it
+        # 検索モードがテキストを使用する場合は、テキストクエリのみを保持し、それ以外は削除します。
+        if not has_text:
+            query_text = None
+
+        # Use semantic L2 reranker if requested and if retrieval mode is text or hybrid (vectors + text)
+        # 検索モードがテキストまたはハイブリッド（ベクトル＋テキスト）の場合、リクエストに応じてセマンティックL2リランカーを使用する。
+        if overrides.get("semantic_ranker") and has_text:
+            r = await self.search_client.search(query_text,
                                           filter=filter,
-                                          query_type=QueryType.SEMANTIC, 
-                                          query_language="ja-jp", 
-                                          query_speller="none", 
-                                          semantic_configuration_name="default", 
-                                          top=top, 
-                                          query_caption="extractive|highlight-false" if use_semantic_captions else None)
+                                          query_type=QueryType.SEMANTIC,
+                                          query_language="ja-jp",
+                                          query_speller="none",
+                                          semantic_configuration_name="default",
+                                          top=top,
+                                          query_caption="extractive|highlight-false" if use_semantic_captions else None,
+                                          vector=query_vector,
+                                          top_k=50 if query_vector else None,
+                                          vector_fields="embedding" if query_vector else None)
         else:
-            r = self.search_client.search(q, filter=filter, top=top)
+            r = await self.search_client.search(query_text,
+                                          filter=filter,
+                                          top=top,
+                                          vector=query_vector,
+                                          top_k=50 if query_vector else None,
+                                          vector_fields="embedding" if query_vector else None)
         if use_semantic_captions:
-            results = [doc[self.sourcepage_field] + ": " + nonewlines(" . ".join([c.text for c in doc['@search.captions']])) for doc in r]
+            results = [doc[self.sourcepage_field] + ": " + nonewlines(" . ".join([c.text for c in doc['@search.captions']])) async for doc in r]
         else:
-            results = [doc[self.sourcepage_field] + ": " + nonewlines(doc[self.content_field]) for doc in r]
+            results = [doc[self.sourcepage_field] + ": " + nonewlines(doc[self.content_field]) async for doc in r]
         content = "\n".join(results)
 
         follow_up_questions_prompt = self.follow_up_questions_prompt_content if overrides.get("suggest_followup_questions") else ""
-        
-        # Allow client to replace the entire prompt, or to inject into the exiting prompt using >>>
-        prompt_override = overrides.get("prompt_template")
-        if prompt_override is None:
-            prompt = self.prompt_prefix.format(injected_prompt="", sources=content, chat_history=self.get_chat_history_as_text(history), follow_up_questions_prompt=follow_up_questions_prompt)
-        elif prompt_override.startswith(">>>"):
-            prompt = self.prompt_prefix.format(injected_prompt=prompt_override[3:] + "\n", sources=content, chat_history=self.get_chat_history_as_text(history), follow_up_questions_prompt=follow_up_questions_prompt)
-        else:
-            prompt = prompt_override.format(sources=content, chat_history=self.get_chat_history_as_text(history), follow_up_questions_prompt=follow_up_questions_prompt)
-        print(len(prompt),prompt)
-        # STEP 3: Generate a contextual and content specific answer using the search results and chat history
-        completion = openai.Completion.create(
-            engine=self.chatgpt_deployment, 
-            prompt=prompt, 
-            temperature=overrides.get("temperature") or 0.0, 
-            max_tokens=2048, 
-            n=1, 
-            stop=["<|im_end|>", "<|im_start|>"])
 
-        return {"data_points": results, "answer": completion.choices[0].text, "thoughts": f"Searched for:<br>{q}<br><br>Prompt:<br>" + prompt.replace('\n', '<br>')}
-    
-    def get_chat_history_as_text(self, history, include_last_turn=True, approx_max_tokens=1000) -> str:
-        history_text = ""
-        for h in reversed(history if include_last_turn else history[:-1]):
-            history_text = """<|im_start|>user""" +"\n" + h["user"] + "\n" + """<|im_end|>""" + "\n" + """<|im_start|>assistant""" + "\n" + (h.get("bot") + """<|im_end|>""" if h.get("bot") else "") + "\n" + history_text
-            if len(history_text) > approx_max_tokens*4:
-                break    
-        return history_text
+        # STEP 3: Generate a contextual and content specific answer using the search results and chat history
+        # 検索結果とチャット履歴を使用して、文脈や内容に応じた回答を生成します。
+
+        # Allow client to replace the entire prompt, or to inject into the exiting prompt using >>>
+        # クライアントがプロンプト全体を置き換えたり、>>を使用して終了するプロンプトに注入したりできるようにする。
+        prompt_override = overrides.get("prompt_override")
+        if prompt_override is None:
+            system_message = self.system_message_chat_conversation.format(injected_prompt="", follow_up_questions_prompt=follow_up_questions_prompt)
+        elif prompt_override.startswith(">>>"):
+            system_message = self.system_message_chat_conversation.format(injected_prompt=prompt_override[3:] + "\n", follow_up_questions_prompt=follow_up_questions_prompt)
+        else:
+            system_message = prompt_override.format(follow_up_questions_prompt=follow_up_questions_prompt)
+
+        messages = self.get_messages_from_history(
+            system_message,
+            self.chatgpt_model,
+            history,
+            history[-1]["user"]+ "\n\nSources:\n" + content, # Model does not handle lengthy system messages well. Moving sources to latest user conversation to solve follow up questions prompt. モデルは長いシステムメッセージをうまく扱えない。フォローアップ質問のプロンプトを解決するために、最新のユーザー会話にソースを移動する。
+            max_tokens=self.chatgpt_token_limit)
+        msg_to_display = '\n\n'.join([str(message) for message in messages])
+
+        extra_info = {"data_points": results, "thoughts": f"Searched for:<br>{query_text}<br><br>Conversations:<br>" + msg_to_display.replace('\n', '<br>')}
+        chat_coroutine = openai.ChatCompletion.acreate(
+                deployment_id=self.chatgpt_deployment,
+                model=self.chatgpt_model,
+                messages=messages,
+                temperature=overrides.get("temperature") or 0.0,
+                max_tokens=1024,
+                n=1,
+                stream=should_stream)
+        return (extra_info, chat_coroutine)
+
+    async def run_without_streaming(self, history: list[dict[str, str]], overrides: dict[str, Any]) -> dict[str, Any]:
+        extra_info, chat_coroutine = await self.run_until_final_call(history, overrides, should_stream=False)
+        chat_content = (await chat_coroutine).choices[0].message.content
+        extra_info["answer"] = chat_content
+        return extra_info
+
+    async def run_with_streaming(self, history: list[dict[str, str]], overrides: dict[str, Any]) -> AsyncGenerator[dict, None]:
+        extra_info, chat_coroutine = await self.run_until_final_call(history, overrides, should_stream=True)
+        yield extra_info
+        async for event in await chat_coroutine:
+            yield event
+
+
+    def get_messages_from_history(self, system_prompt: str, model_id: str, history: list[dict[str, str]], user_conv: str, few_shots = [], max_tokens: int = 4096) -> list:
+        message_builder = MessageBuilder(system_prompt, model_id)
+
+        # Add examples to show the chat what responses we want. It will try to mimic any responses and make sure they match the rules laid out in the system message.
+        # どのような応答が欲しいかをチャットに示す例を追加してください。チャットはどのような応答でも模倣しようとし、システムメッセージに示されたルールに一致することを確認します。
+        for shot in few_shots:
+            message_builder.append_message(shot.get('role'), shot.get('content'))
+
+        user_content = user_conv
+        append_index = len(few_shots) + 1
+
+        message_builder.append_message(self.USER, user_content, index=append_index)
+
+        for h in reversed(history[:-1]):
+            if bot_msg := h.get("bot"):
+                message_builder.append_message(self.ASSISTANT, bot_msg, index=append_index)
+            if user_msg := h.get("user"):
+                message_builder.append_message(self.USER, user_msg, index=append_index)
+            if message_builder.token_length > max_tokens:
+                break
+
+        messages = message_builder.messages
+        return messages

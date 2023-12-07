@@ -1,5 +1,6 @@
 # Azure az webapp deployment details
 .azure
+*_env
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -145,5 +146,5 @@ npm-debug.log*
 node_modules
 static/
 
-output/
+backend_env
 .DS_Store

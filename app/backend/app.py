@@ -36,8 +36,8 @@ from approaches.retrievethenread import RetrieveThenReadApproach
 # Replace these with your own values, either in environment variables or directly here
 AZURE_STORAGE_ACCOUNT = os.getenv("AZURE_STORAGE_ACCOUNT", "mystorageaccount")
 AZURE_STORAGE_CONTAINER = os.getenv("AZURE_STORAGE_CONTAINER", "content")
-AZURE_SEARCH_SERVICE = os.getenv("AZURE_SEARCH_SERVICE", "test-indexer001")
-AZURE_SEARCH_INDEX = os.getenv("AZURE_SEARCH_INDEX", "vector-1707723314753")
+AZURE_SEARCH_SERVICE = os.getenv("AZURE_SEARCH_SERVICE", "test-indexer002")
+AZURE_SEARCH_INDEX = os.getenv("AZURE_SEARCH_INDEX", "vector-1707724882940")
 AZURE_OPENAI_SERVICE = os.getenv("AZURE_OPENAI_SERVICE", "myopenai")
 AZURE_OPENAI_CHATGPT_MODEL = os.getenv("AZURE_OPENAI_CHATGPT_MODEL", "gpt-35-turbo-16k")
 AZURE_OPENAI_GPT_DEPLOYMENT = os.getenv("AZURE_OPENAI_GPT_DEPLOYMENT", "davinci")

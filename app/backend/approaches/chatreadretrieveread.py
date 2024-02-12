@@ -148,14 +148,14 @@ If you cannot generate a search query, return only the number 0.
                                           query_caption="extractive|highlight-false" if use_semantic_captions else None,
                                           vector=query_vector,
                                           top_k=50 if query_vector else None,
-                                          vector_fields="embedding" if query_vector else None)
+                                          vector_fields="vector" if query_vector else None)
         else:
             r = await self.search_client.search(query_text,
                                           filter=filter,
                                           top=top,
                                           vector=query_vector,
                                           top_k=50 if query_vector else None,
-                                          vector_fields="embedding" if query_vector else None)
+                                          vector_fields="vector" if query_vector else None)
         if use_semantic_captions:
             results = [doc[self.sourcepage_field] + ": " + nonewlines(" . ".join([c.text for c in doc['@search.captions']])) async for doc in r]
         else:
